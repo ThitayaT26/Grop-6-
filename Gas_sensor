@@ -1,1 +1,242 @@
-//ตรวจแก๊ช
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Gas Leak Detector - FULL FIXED MODE - NUCLEO-C031C6
+ ******************************************************************************
+ */
+
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+
+/* ตัวแปร handle สำหรับ COM port และ ADC */
+COM_InitTypeDef BspCOMInit;
+ADC_HandleTypeDef hadc1;
+
+/* USER CODE BEGIN PV */
+#define GAS_WARN_THRESHOLD   1500  /* ค่า ADC ที่เริ่มเตือน (ประมาณ 1.2V) */
+#define GAS_ALARM_THRESHOLD  2500  /* ค่า ADC อันตราย (ประมาณ 2.0V) */
+
+#define SAMPLE_INTERVAL_MS   3000  /* วัดค่าแก๊สทุก 3 วินาที */
+#define BLINK_INTERVAL_MS     200  /* ความถี่ในการกระพริบของ LED ตอน Warning (200ms) */
+
+uint32_t lastSampleTick = 0;       /* เก็บเวลาครั้งล่าสุดที่วัดค่าแก๊ส */
+uint32_t lastBlinkTick = 0;        /* เก็บเวลาครั้งล่าสุดที่ LED กระพริบ */
+
+char txBuf[160];                   /* buffer สำหรับข้อความที่จะส่งออก UART */
+extern UART_HandleTypeDef hcom_uart[COMn]; /* UART handle ของ BSP */
+/* USER CODE END PV */
+
+/* ประกาศฟังก์ชันที่จะใช้งาน */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+void VCP_Print(const char* str);
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* Reset ของระบบ peripherals, Initialize Flash interface และ Systick */
+  HAL_Init();
+
+  /* ตั้งค่า Clock ระบบ */
+  SystemClock_Config();
+
+  /* ตั้งค่าระบบ GPIO และ ADC */
+  MX_GPIO_Init();
+  MX_ADC1_Init();
+
+  /* ตั้งค่า UART สำหรับส่งข้อมูลออก USB Virtual COM Port (115200 baud, 8N1) */
+  BspCOMInit.BaudRate   = 115200;
+  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
+  BspCOMInit.StopBits   = COM_STOPBITS_1;
+  BspCOMInit.Parity     = COM_PARITY_NONE;
+  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+
+  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE) {
+    Error_Handler(); /* ถ้าเปิดพอร์ตไม่สำเร็จให้หยุดทำงาน */
+  }
+  
+  HAL_Delay(200); /* รอให้ระบบ UART เคลียร์สัญญาณพร้อมใช้งาน */
+
+  /* ตัวแปรสำหรับเก็บค่าสถานะล่าสุด */
+  uint32_t adcVal = 0;
+  float voltage = 0.0f;
+  const char* status = "[ OK ] Air quality normal ";
+  const char* bar = "||||----------------";
+
+  /* Infinite loop */
+  while (1)
+  {
+    uint32_t currentTick = HAL_GetTick();
+
+    /* 1. ส่วนของการอ่านค่าเซนเซอร์ (ทำทุก ๆ 3 วินาที) */
+    if ((currentTick - lastSampleTick) >= SAMPLE_INTERVAL_MS)
+    {
+      lastSampleTick = currentTick; /* อัปเดตเวลาล่าสุดที่อ่านค่า */
+
+      /* เริ่มทำงานและอ่านค่าจาก ADC */
+      HAL_ADC_Start(&hadc1);
+      if (HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY) == HAL_OK) {
+        adcVal = HAL_ADC_GetValue(&hadc1);
+      }
+      HAL_ADC_Stop(&hadc1);
+
+      /* คำนวณแรงดันไฟฟ้า (12-bit ADC -> 4095) */
+      voltage = (float)adcVal * 3.3f / 4095.0f;
+
+      /* ประเมินสถานะเพื่อเตรียมข้อความสำหรับพ่นออก Console */
+      if (adcVal >= GAS_ALARM_THRESHOLD) {
+        status = "[!! ALARM !!] GAS LEVEL CRITICAL";
+        bar    = "||||||||||||||||||||";
+      }
+      else if (adcVal >= GAS_WARN_THRESHOLD) {
+        status = "[ WARNING ] Gas level elevated ";
+        bar    = "||||||||||----------";
+      }
+      else {
+        status = "[ OK ] Air quality normal ";
+        bar    = "||||----------------";
+      }
+
+      /* จัดรูปแบบข้อความส่งออกไปยัง Serial Monitor */
+      snprintf(txBuf, sizeof(txBuf),
+               "%s | ADC=%4lu | V=%.3fV | [%s]\r\n",
+               status, adcVal, voltage, bar);
+      VCP_Print(txBuf);
+    }
+
+    /* 2. ส่วนของระบบควบคุมไฟ LED (แยกทำงานอิสระตามสถานะปัจจุบัน) */
+    if (adcVal >= GAS_ALARM_THRESHOLD) {
+      /* สถานะอันตราย: สั่งให้ LED ติดค้างทันที */
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+    }
+    else if (adcVal >= GAS_WARN_THRESHOLD) {
+      /* สถานะเตือนภัย: สั่งให้กระพริบถี่ตามเวลา BLINK_INTERVAL_MS (200ms) */
+      if ((currentTick - lastBlinkTick) >= BLINK_INTERVAL_MS) {
+        lastBlinkTick = currentTick;
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      }
+    }
+    else {
+      /* สถานะปกติ: สั่งให้ LED ดับ */
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+    }
+
+  }
+}
+
+/**
+  * @brief ส่งข้อความออก Terminal ผ่าน Virtual COM Port (VCP)
+  */
+void VCP_Print(const char* str) {
+  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)str, strlen(str), HAL_MAX_DELAY);
+}
+
+/**
+  * @brief ระบบตั้งค่า Clock (ใช้ External Crystal HSE)
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.HCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK) {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ตั้งค่า ADC1 (12-bit, Single Conversion, Channel 0 / ขา PA0)
+  */
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_SEQ_FIXED;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.LowPowerAutoPowerOff = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  
+  /* ขยับมาใช้ 39.5 Cycles เพื่อให้อ่านค่าจาก Gas Sensor ได้นิ่งและเสถียรขึ้น */
+  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_39CYCLES_5; 
+  
+  hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK) {
+    Error_Handler();
+  }
+
+  /* เลือกเซนเซอร์เข้าขา PA0 (Channel 0) */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ตั้งค่า GPIO (ขา PA5 สำหรับควบคุม LED LD4 Onboard)
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* เปิดสัญญาณ Clock ให้กับพอร์ตที่เกี่ยวข้อง */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /* ตั้งค่าขา PA5 เป็นโหมด Output */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* เริ่มต้นด้วยการสั่งให้ LED ดับ */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+}
+
+/**
+  * @brief ฟังก์ชันจัดการระบบเมื่อเกิดข้อผิดพลาดรุนแรง
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+    /* บอร์ดจะค้างอยู่ที่นี่หากเกิดข้อผิดพลาดในการ Init ระบบ */
+  }
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif
