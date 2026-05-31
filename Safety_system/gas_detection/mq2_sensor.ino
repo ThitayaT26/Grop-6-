@@ -37,9 +37,7 @@ void loop_mq2(){
       Serial.println("[Gas] Normal");
     }
   }
-  
   delay(1000);
-  
 }
 
 int getMq2Value(){
