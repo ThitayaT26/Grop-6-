@@ -1,0 +1,487 @@
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : FIRE DETECTOR - NUCLEO-C031C6
+ * @description    : ตรวจจับควันและเปลวไฟ พร้อมระบบแจ้งเตือน 3 ระดับ
+ ******************************************************************************
+ */
+
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+
+/* ตัวแปร handle สำหรับ COM port และ ADC */
+COM_InitTypeDef BspCOMInit;
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;  /* สำหรับ Flame Sensor อีกตัว */
+
+/* USER CODE BEGIN PV */
+
+/* ========== ค่า Threshold สำหรับตรวจจับไฟไหม้ ========== */
+#define SMOKE_WARNING_THRESHOLD    800   /* ควันเริ่มผิดปกติ */
+#define SMOKE_ALARM_THRESHOLD      1800  /* ควันหนาระดับอันตราย */
+#define FLAME_DETECT_THRESHOLD     500   /* ตรวจจับเปลวไฟ (ค่า ADC ต่ำเพราะ IR) */
+
+/* ========== เวลาสำหรับระบบต่างๆ ========== */
+#define SMOKE_SAMPLE_INTERVAL_MS   1000  /* ตรวจควันทุก 1 วินาที */
+#define FLAME_SAMPLE_INTERVAL_MS   200   /* ตรวจเปลวไฟทุก 0.2 วินาที */
+#define ALARM_BLINK_FAST_MS        100   /* กระพริบเร็วมาก (อันตราย) */
+#define ALARM_BLINK_SLOW_MS        500   /* กระพริบช้า (เตือนภัย) */
+#define BUZZER_ON_DURATION_MS      200   /* เสียงบัซเซอร์ดัง 200ms */
+#define BUZZER_OFF_DURATION_MS     800   /* เงียบ 800ms */
+
+/* ========== ขา GPIO ========== */
+/* LED แจ้งเตือน */
+#define LED_RED_PIN      GPIO_PIN_5   /* PA5 - LED สีแดง (อันตราย) */
+#define LED_YELLOW_PIN   GPIO_PIN_6   /* PA6 - LED สีเหลือง (เตือน) */
+#define LED_GREEN_PIN    GPIO_PIN_7   /* PA7 - LED สีเขียว (ปกติ) */
+
+/* Buzzer และเซนเซอร์ */
+#define BUZZER_PIN       GPIO_PIN_8   /* PA8 - Buzzer */
+#define FLAME_SENSOR_PIN GPIO_PIN_0   /* PA0 - Flame Sensor (ADC1) */
+#define SMOKE_SENSOR_PIN GPIO_PIN_1   /* PA1 - Smoke Sensor (ADC2) */
+
+/* ========== สถานะการแจ้งเตือน ========== */
+typedef enum {
+    FIRE_STATE_NORMAL = 0,      /* ปกติ */
+    FIRE_STATE_WARNING,          /* เตือนภัย (ควันเล็กน้อย) */
+    FIRE_STATE_ALARM,            /* อันตราย (ควันมากหรือมีเปลวไฟ) */
+    FIRE_STATE_CRITICAL          /* วิกฤต (ควัน+เปลวไฟ) */
+} FireState_t;
+
+/* ตัวแปรเก็บสถานะ */
+FireState_t currentState = FIRE_STATE_NORMAL;
+FireState_t lastState = FIRE_STATE_NORMAL;
+
+/* ตัวแปรสำหรับ ADC */
+volatile uint32_t smokeAdcValue = 0;
+volatile uint32_t flameAdcValue = 0;
+volatile uint8_t smokeDataReady = 0;
+volatile uint8_t flameDataReady = 0;
+
+/* ตัวแปรสำหรับ timing */
+uint32_t lastSmokeTick = 0;
+uint32_t lastFlameTick = 0;
+uint32_t lastBlinkTick = 0;
+uint32_t lastBuzzerTick = 0;
+uint8_t buzzerState = 0;
+
+/* Buffer สำหรับ UART */
+char txBuf[256];
+extern UART_HandleTypeDef hcom_uart[COMn];
+
+/* ประกาศฟังก์ชัน */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_ADC2_Init(void);
+void VCP_Print(const char* str);
+void UpdateFireState(void);
+void ControlIndicators(void);
+void PrintFireReport(void);
+void EmergencyShutdown(void);
+
+/* USER CODE END PV */
+
+/**
+  * @brief Main function
+  */
+int main(void)
+{
+    /* ระบบเริ่มต้น */
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_ADC1_Init();  /* Flame Sensor */
+    MX_ADC2_Init();  /* Smoke Sensor */
+    
+    /* ตั้งค่า UART */
+    BspCOMInit.BaudRate   = 115200;
+    BspCOMInit.WordLength = COM_WORDLENGTH_8B;
+    BspCOMInit.StopBits   = COM_STOPBITS_1;
+    BspCOMInit.Parity     = COM_PARITY_NONE;
+    BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+    
+    if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE) {
+        Error_Handler();
+    }
+    
+    /* แสดงข้อความเริ่มต้นระบบ */
+    VCP_Print("\r\n\r\n========================================\r\n");
+    VCP_Print("     FIRE DETECTION SYSTEM v1.0\r\n");
+    VCP_Print("========================================\r\n");
+    VCP_Print("System Initialized - Monitoring...\r\n\r\n");
+    
+    HAL_Delay(500);
+    
+    /* ตั้งค่าเริ่มต้น LED สีเขียวติด */
+    HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, LED_YELLOW_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LED_RED_PIN, GPIO_PIN_RESET);
+    
+    /* Infinite loop */
+    while (1)
+    {
+        uint32_t currentTick = HAL_GetTick();
+        
+        /* ========== 1. อ่านค่าเซนเซอร์ควัน (MQ-2) ========== */
+        if ((currentTick - lastSmokeTick) >= SMOKE_SAMPLE_INTERVAL_MS)
+        {
+            lastSmokeTick = currentTick;
+            
+            HAL_ADC_Start(&hadc2);
+            if (HAL_ADC_PollForConversion(&hadc2, 100) == HAL_OK) {
+                smokeAdcValue = HAL_ADC_GetValue(&hadc2);
+                smokeDataReady = 1;
+            }
+            HAL_ADC_Stop(&hadc2);
+        }
+        
+        /* ========== 2. อ่านค่าเซนเซอร์เปลวไฟ (Flame Sensor) ========== */
+        if ((currentTick - lastFlameTick) >= FLAME_SAMPLE_INTERVAL_MS)
+        {
+            lastFlameTick = currentTick;
+            
+            HAL_ADC_Start(&hadc1);
+            if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK) {
+                flameAdcValue = HAL_ADC_GetValue(&hadc1);
+                flameDataReady = 1;
+            }
+            HAL_ADC_Stop(&hadc1);
+        }
+        
+        /* ========== 3. อัปเดตสถานะการแจ้งเตือน ========== */
+        if (smokeDataReady || flameDataReady) {
+            UpdateFireState();
+            smokeDataReady = 0;
+            flameDataReady = 0;
+        }
+        
+        /* ========== 4. ควบคุมไฟ LED และ Buzzer ========== */
+        ControlIndicators();
+        
+        /* ========== 5. รายงานผลทาง Serial ทุก 5 วินาที ========== */
+        static uint32_t lastReportTick = 0;
+        if ((currentTick - lastReportTick) >= 5000) {
+            lastReportTick = currentTick;
+            PrintFireReport();
+        }
+        
+        /* ========== 6. ระบบฉุกเฉินอัตโนมัติ ========== */
+        if (currentState == FIRE_STATE_CRITICAL) {
+            EmergencyShutdown();
+        }
+        
+        /* ป้องกัน watchdog time-out (ถ้าใช้งาน) */
+        HAL_Delay(10);
+    }
+}
+
+/**
+  * @brief อัปเดตสถานะไฟไหม้จากค่าเซนเซอร์
+  */
+void UpdateFireState(void)
+{
+    FireState_t newState = currentState;
+    uint8_t hasFlame = (flameAdcValue < FLAME_DETECT_THRESHOLD);  /* Flame sensor output ต่ำเมื่อเจอไฟ */
+    uint8_t hasSmoke = (smokeAdcValue > SMOKE_WARNING_THRESHOLD);
+    uint8_t heavySmoke = (smokeAdcValue > SMOKE_ALARM_THRESHOLD);
+    
+    /* ตรรกะการตัดสินใจ */
+    if (hasFlame && heavySmoke) {
+        newState = FIRE_STATE_CRITICAL;  /* วิกฤต: มีทั้งไฟและควันหนา */
+    }
+    else if (hasFlame || heavySmoke) {
+        newState = FIRE_STATE_ALARM;      /* อันตราย: มีไฟ หรือ ควันหนา */
+    }
+    else if (hasSmoke) {
+        newState = FIRE_STATE_WARNING;    /* เตือน: มีควันเล็กน้อย */
+    }
+    else {
+        newState = FIRE_STATE_NORMAL;      /* ปกติ */
+    }
+    
+    /* ถ้าสถานะเปลี่ยน ให้แจ้งเตือนทันที */
+    if (newState != currentState) {
+        currentState = newState;
+        
+        /* แจ้งเตือนทาง Serial */
+        snprintf(txBuf, sizeof(txBuf), 
+                 "\r\n[STATUS CHANGE] State: %s\r\n",
+                 (currentState == FIRE_STATE_NORMAL) ? "NORMAL" :
+                 (currentState == FIRE_STATE_WARNING) ? "WARNING" :
+                 (currentState == FIRE_STATE_ALARM) ? "ALARM" : "CRITICAL");
+        VCP_Print(txBuf);
+        
+        /* บันทึกเวลา */
+        snprintf(txBuf, sizeof(txBuf), 
+                 "Smoke: %lu | Flame: %lu\r\n",
+                 smokeAdcValue, flameAdcValue);
+        VCP_Print(txBuf);
+    }
+}
+
+/**
+  * @brief ควบคุม LED และ Buzzer ตามสถานะ
+  */
+void ControlIndicators(void)
+{
+    uint32_t currentTick = HAL_GetTick();
+    
+    /* ควบคุม LED ตามสถานะ */
+    switch(currentState) {
+        case FIRE_STATE_NORMAL:
+            /* LED เขียวติด, เหลืองและแดงดับ */
+            HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOA, LED_YELLOW_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, LED_RED_PIN, GPIO_PIN_RESET);
+            break;
+            
+        case FIRE_STATE_WARNING:
+            /* LED เหลืองกระพริบช้า */
+            HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN, GPIO_PIN_RESET);
+            if ((currentTick - lastBlinkTick) >= ALARM_BLINK_SLOW_MS) {
+                lastBlinkTick = currentTick;
+                HAL_GPIO_TogglePin(GPIOA, LED_YELLOW_PIN);
+            }
+            HAL_GPIO_WritePin(GPIOA, LED_RED_PIN, GPIO_PIN_RESET);
+            break;
+            
+        case FIRE_STATE_ALARM:
+            /* LED แดงกระพริบเร็ว */
+            HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, LED_YELLOW_PIN, GPIO_PIN_RESET);
+            if ((currentTick - lastBlinkTick) >= ALARM_BLINK_FAST_MS) {
+                lastBlinkTick = currentTick;
+                HAL_GPIO_TogglePin(GPIOA, LED_RED_PIN);
+            }
+            break;
+            
+        case FIRE_STATE_CRITICAL:
+            /* LED แดงติดค้าง + กระพริบเร็วพิเศษ */
+            HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, LED_YELLOW_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, LED_RED_PIN, GPIO_PIN_SET);
+            /* กระพริบซ้อนด้วยความเร็วสูง */
+            if ((currentTick - lastBlinkTick) >= 50) {
+                lastBlinkTick = currentTick;
+                HAL_GPIO_TogglePin(GPIOA, LED_RED_PIN);
+            }
+            break;
+    }
+    
+    /* ควบคุม Buzzer เฉพาะสถานะ ALARM และ CRITICAL */
+    if (currentState >= FIRE_STATE_ALARM) {
+        if ((currentTick - lastBuzzerTick) >= 
+            (buzzerState ? BUZZER_ON_DURATION_MS : BUZZER_OFF_DURATION_MS)) {
+            lastBuzzerTick = currentTick;
+            buzzerState = !buzzerState;
+            HAL_GPIO_WritePin(GPIOA, BUZZER_PIN, buzzerState ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        }
+    } else {
+        /* ปิด Buzzer กรณีไม่เกิดเหตุ */
+        HAL_GPIO_WritePin(GPIOA, BUZZER_PIN, GPIO_PIN_RESET);
+        buzzerState = 0;
+    }
+}
+
+/**
+  * @brief รายงานสถานะทาง Serial
+  */
+void PrintFireReport(void)
+{
+    const char* stateStr;
+    const char* riskLevel;
+    
+    switch(currentState) {
+        case FIRE_STATE_NORMAL:
+            stateStr = "NORMAL";
+            riskLevel = "LOW";
+            break;
+        case FIRE_STATE_WARNING:
+            stateStr = "WARNING";
+            riskLevel = "MEDIUM";
+            break;
+        case FIRE_STATE_ALARM:
+            stateStr = "ALARM";
+            riskLevel = "HIGH";
+            break;
+        case FIRE_STATE_CRITICAL:
+            stateStr = "CRITICAL";
+            riskLevel = "EXTREME";
+            break;
+    }
+    
+    snprintf(txBuf, sizeof(txBuf),
+             "\r\n[FIRE REPORT]\r\n"
+             "Status: %s | Risk: %s\r\n"
+             "Smoke Sensor: %4lu ADC (Threshold: %d/%d)\r\n"
+             "Flame Sensor: %4lu ADC (Detect when < %d)\r\n"
+             "Recommend: %s\r\n"
+             "----------------------------------------\r\n",
+             stateStr, riskLevel,
+             smokeAdcValue, SMOKE_WARNING_THRESHOLD, SMOKE_ALARM_THRESHOLD,
+             flameAdcValue, FLAME_DETECT_THRESHOLD,
+             (currentState == FIRE_STATE_NORMAL) ? "Normal monitoring" :
+             (currentState == FIRE_STATE_WARNING) ? "Check for smoke source" :
+             (currentState == FIRE_STATE_ALARM) ? "EVACUATE IMMEDIATELY!" :
+             "FIRE! CALL EMERGENCY SERVICES!");
+    
+    VCP_Print(txBuf);
+    
+    /* แสดง bar graph ควัน */
+    int barLength = (smokeAdcValue * 20) / 4095;
+    if (barLength > 20) barLength = 20;
+    snprintf(txBuf, sizeof(txBuf), "Smoke: [%-20s] %d%%\r\n",
+             "####################" + (20 - barLength),
+             (smokeAdcValue * 100) / 4095);
+    VCP_Print(txBuf);
+}
+
+/**
+  * @brief ระบบฉุกเฉินอัตโนมัติ
+  */
+void EmergencyShutdown(void)
+{
+    static uint8_t emergencyTriggered = 0;
+    
+    if (!emergencyTriggered) {
+        emergencyTriggered = 1;
+        
+        VCP_Print("\r\n!!! EMERGENCY PROTOCOL ACTIVATED !!!\r\n");
+        VCP_Print("- Cutting off gas supply (simulated)\r\n");
+        VCP_Print("- Activating fire suppression (simulated)\r\n");
+        VCP_Print("- Calling emergency services (simulated)\r\n");
+        VCP_Print("- Unlocking emergency exits (simulated)\r\n\r\n");
+        
+        /* ที่นี่สามารถเพิ่มโค้ดสั่งงานอุปกรณ์จริงๆ เช่น */
+        /* HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); // ตัดแก๊ส */
+        /* HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET); // เปิดสปริงเกอร์ */
+    }
+}
+
+/**
+  * @brief ส่งข้อความทาง UART
+  */
+void VCP_Print(const char* str) {
+    HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)str, strlen(str), HAL_MAX_DELAY);
+}
+
+/**
+  * @brief ตั้งค่า System Clock (HSE 8MHz)
+  */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    
+    __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_1);
+    
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
+    
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
+    RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.HCLKDivider = RCC_HCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+/**
+  * @brief ตั้งค่า ADC1 สำหรับ Flame Sensor (Channel 0)
+  */
+static void MX_ADC1_Init(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    
+    hadc1.Instance = ADC1;
+    hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.ScanConvMode = ADC_SCAN_SEQ_FIXED;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc1.Init.LowPowerAutoWait = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.NbrOfConversion = 1;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_39CYCLES_5;
+    
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) {
+        Error_Handler();
+    }
+    
+    sConfig.Channel = ADC_CHANNEL_0;
+    sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+/**
+  * @brief ตั้งค่า ADC2 สำหรับ Smoke Sensor (Channel 1)
+  */
+static void MX_ADC2_Init(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    
+    hadc2.Instance = ADC1;  /* ใช้ ADC1 เหมือนกัน แต่คนละ Channel */
+    hadc2.Init = hadc1.Init;  /* Copy config */
+    
+    if (HAL_ADC_Init(&hadc2) != HAL_OK) {
+        Error_Handler();
+    }
+    
+    sConfig.Channel = ADC_CHANNEL_1;
+    sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
+    if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+/**
+  * @brief ตั้งค่า GPIO
+  */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    
+    /* Enable clocks */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    
+    /* ตั้งค่า LED และ Buzzer */
+    GPIO_InitStruct.Pin = LED_RED_PIN | LED_YELLOW_PIN | LED_GREEN_PIN | BUZZER_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    
+    /* เริ่มต้นทั้งหมดเป็น LOW */
+    HAL_GPIO_WritePin(GPIOA, LED_RED_PIN | LED_YELLOW_PIN | LED_GREEN_PIN | BUZZER_PIN, 
+                      GPIO_PIN_RESET);
+}
+
+/**
+  * @brief Error handler
+  */
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {
+        /* Blink all LEDs to indicate error */
+        HAL_GPIO_TogglePin(GPIOA, LED_RED_PIN | LED_YELLOW_PIN | LED_GREEN_PIN);
+        HAL_Delay(100);
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif
