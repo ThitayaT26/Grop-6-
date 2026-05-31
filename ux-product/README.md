@@ -42,8 +42,8 @@
 *   **หัวฉีดเรียวปลาย (Nozzle Tip):** ใช้รูปทรงกรวย (Cone) ปรับระยะ Top Radius บีบปลายท่อเหลือ ø 4 mm และเจาะรูรีดละอองฝอยภายในขนาดจิ๋ว ø 1.5 mm เพื่อเพิ่มแรงดันสเปรย์น้ำสบู่โฟม
 
 ### 🔗 Link & Artifacts
-*   **3D Model View:** https://www.tinkercad.com/things/1XUFRQF20FM-surprising-jofo-hillar
-*   **3D File (.STL):** 
+*   **3D Model View:** [คลิกเพื่อเข้าชมโมเดล 3 มิติบน Tinkercad](https://www.tinkercad.com/things/1XUFRQF20FM-surprising-jofo-hillar)
+*   **3D File (.STL):** ![Smart Haven Foam Nozzle 3D Model](Screenshot 2026-05-31 224340.png)
 ---
 
 ## 📊 5. Usability Testing & Risk Control
