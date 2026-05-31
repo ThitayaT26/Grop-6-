@@ -43,7 +43,9 @@
 
 ### 🔗 Link & Artifacts
 *   **3D Model View:** [คลิกเพื่อเข้าชมโมเดล 3 มิติบน Tinkercad](https://www.tinkercad.com/things/1XUFRQF20FM-surprising-jofo-hillar)
-*   **3D File (.STL):** ![Smart Haven Foam Nozzle 3D Model](Screenshot 2026-05-31 224340.png)
+*   **3D File (.STL):** คลังไฟล์ต้นแบบสามมิติที่อัปโหลดเข้าสู่ระบบเรียบร้อยแล้ว
+
+![Smart Haven Foam Nozzle 3D Model](Screenshot 2026-05-31 224340.png)
 ---
 
 ## 📊 5. Usability Testing & Risk Control
