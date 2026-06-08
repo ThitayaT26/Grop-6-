@@ -62,8 +62,9 @@ void setupWiFi() {
     Serial.println(WiFi.localIP());
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     Serial.println("⏰ Time synced!");
-  } else {
-    Serial.println("\n❌ Wi-Fi failed - ตรวจสอบ SSID และ Password");
+  } 
+  else {
+    Serial.println("\n❌ Wi-Fi failed - โปรดตรวจสอบ SSID และ Password");
   }
   Serial.println("-------------------------------------------");
 }
